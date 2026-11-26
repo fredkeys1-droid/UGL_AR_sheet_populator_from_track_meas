@@ -3,16 +3,16 @@
 UGL AR-Sheet / TRW Before & After Populator (Streamlit App)
 ===========================================================
 Ingests a client UGL AR-Sheet (TRWxxxx) template and a TrackMeas app export
-workbook, populates header metadata, matches/inserts measurement rows by KM
-(rounded to 3 decimal places), formats Ballast ticks in Wingdings 2 ('P')
-whenever After measurements exist, appends a 'Comments' column, and exports
-the styled workbook with a user-defined filename prefix.
+workbook, populates header metadata, matches existing UGL rows within +/- 1m
+(0.001 km) of the TrackMeas export meterage without inserting extra rows,
+populates the TCM Error formula in Column O, formats Ballast ticks in
+Wingdings 2 ('P') whenever After measurements exist, appends a 'Comments'
+column, and exports the styled workbook with a user-defined filename prefix.
 """
 
 import io
 import datetime
 from copy import copy
-from pathlib import Path
 
 import numpy as np
 import openpyxl
@@ -35,7 +35,8 @@ st.markdown(
     Upload your client **UGL AR-Sheet (`TRWxxxx`)** design template and your **TrackMeas App Export** 
     to automatically populate:
     * **Header Metadata:** `Date of Works`, `Supervisor`, and `Certifying Officer`
-    * **Before & After Measurements:** Matched by Location KM (`Kilometerage / 1000`, rounded to 3 decimals) with any extra measured locations inserted in chronological KM order
+    * **Before & After Measurements:** Matched strictly to existing UGL rows within **±1 m (`0.001 km`)** of the measured location (no extra rows inserted)
+    * **TCM Error Formula (`Col O`):** `=IF(M{r}="","",IF(K{r}="H",L{r}-N{r},N{r}-L{r}))` applied across data rows
     * **Ballast Ticks (`Down`, `Crib`, `Up`):** Formatted in **Wingdings 2** (`P` = ✔) on every row containing an **After** measurement
     * **Comments Column:** Appended cleanly to the right end of the table (`Col AC`)
     """
@@ -86,7 +87,6 @@ def format_date_val(val):
     if isinstance(val, (datetime.datetime, datetime.date)):
         return val.strftime("%d/%m/%Y")
     s = str(val).strip()
-    # Handle ISO timestamp strings like '2026-11-22 00:00:00'
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
         try:
             dt = datetime.datetime.strptime(s, fmt)
@@ -101,7 +101,7 @@ def parse_app_export(app_bytes: bytes):
     Parse the TrackMeas app export workbook ('Deliverables' or first matching sheet).
     Returns:
       - meta: dict with 'date', 'team_leader'
-      - records: dict keyed by rounded 3-decimal KM float -> dict of mapped fields
+      - records: list of dicts with exact 'km' float (Kilometerage / 1000) and mapped fields
       - logs: list of status strings
     """
     logs = []
@@ -118,7 +118,6 @@ def parse_app_export(app_bytes: bytes):
         for c in range(1, min(30, ws.max_column + 1)):
             cell_txt = str(ws.cell(r, c).value or "").strip().upper()
             if "TEAM LEADER" in cell_txt and team_leader is None:
-                # Look right across next 5 cells for value
                 for offset in range(1, 6):
                     candidate = clean_str(ws.cell(r, c + offset).value)
                     if candidate:
@@ -148,10 +147,9 @@ def parse_app_export(app_bytes: bytes):
             break
 
     if header_row is None:
-        header_row = 22  # Default fallback
+        header_row = 22
         logs.append("Warning: 'KILOMETRAGE' header not found dynamically; defaulting to Row 22.")
 
-    # Map column indices dynamically from group header (header_row) + subheader (header_row + 1)
     col_map = {
         "km": 2,          # B
         "peg": 3,         # C (U / D)
@@ -200,16 +198,16 @@ def parse_app_export(app_bytes: bytes):
             elif sub == "AFTER":
                 col_map["tc_aft"] = c
 
-    # Data starts after subheader rows (header_row + 3 in template where Row 22=group, 23=sub, 24=units, 25=data)
     data_start = header_row + 3
-    records = {}
+    records = []
 
     for r in range(data_start, ws.max_row + 1):
         raw_km = ws.cell(r, col_map["km"]).value
         if raw_km is None or str(raw_km).strip() == "":
             continue
         try:
-            km_float = round(float(raw_km) / 1000.0, 3)
+            # Keep full precision in km (1m = 0.001 km) so +/- 1m matching isn't skewed by premature rounding
+            km_float = float(raw_km) / 1000.0
         except (ValueError, TypeError):
             continue
 
@@ -228,7 +226,6 @@ def parse_app_export(app_bytes: bytes):
             "comments": clean_str(ws.cell(r, col_map["comments"]).value),
         }
 
-        # Check if any measurement or comment exists on this row
         has_any_data = any(
             rec[k] is not None
             for k in [
@@ -239,17 +236,17 @@ def parse_app_export(app_bytes: bytes):
             ]
         )
         if has_any_data:
-            records[km_float] = rec
+            records.append(rec)
 
     logs.append(f"Extracted {len(records)} active measurement rows from TrackMeas export.")
     return {"date": date_val, "team_leader": team_leader}, records, logs
 
 
-def populate_trw_workbook(trw_bytes: bytes, meta: dict, records: dict):
+def populate_trw_workbook(trw_bytes: bytes, meta: dict, records: list, tolerance_m: float = 1.0):
     """
-    Populate the UGL TRW workbook in-place, preserving formatting and merged cells,
-    inserting extra KM rows in sorted order, adding Wingdings 2 'P' ticks where After
-    data exists, and appending the 'Comments' column in Column AC.
+    Populate the UGL TRW workbook in-place without inserting extra rows.
+    Matches existing TRW rows to TrackMeas export measurements within +/- tolerance_m (default 1.0m),
+    picking the closest measurement (and assigning each measurement 1-to-1 to its nearest TRW row).
     """
     logs = []
     wb = openpyxl.load_workbook(io.BytesIO(trw_bytes))
@@ -280,93 +277,48 @@ def populate_trw_workbook(trw_bytes: bytes, meta: dict, records: dict):
         copy_cell_style(ws.cell(r, 28), ws.cell(r, comments_col))
         ws.cell(r, comments_col).alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-    # 3. Map existing TRW data rows (starting at Row 15)
+    # 3. Collect existing TRW data rows (starting at Row 15)
     data_start_row = 15
-    existing_km_rows = {}  # km_float -> row_idx
+    trw_rows = []  # list of (row_idx, km_float)
     for r in range(data_start_row, ws.max_row + 1):
         val = ws.cell(r, 2).value
         if val is not None and str(val).strip() != "":
             try:
-                km_k = round(float(val), 3)
-                existing_km_rows[km_k] = r
+                km_k = float(val)
+                trw_rows.append((r, km_k))
             except (ValueError, TypeError):
                 continue
 
-    # 4. Identify extra KMs from TrackMeas export that don't exist in TRW template
-    extra_kms = sorted([km for km in records.keys() if km not in existing_km_rows])
-    logs.append(f"Matched {len(records) - len(extra_kms)} existing KM rows; inserting {len(extra_kms)} new KM rows.")
+    # 4. Match TrackMeas records to existing TRW rows within +/- tolerance_m (1-to-1 closest match)
+    tolerance_km = tolerance_m / 1000.0
+    candidate_pairs = []
+    for trw_idx, (r, trw_km) in enumerate(trw_rows):
+        for rec_idx, rec in enumerate(records):
+            diff_km = abs(trw_km - rec["km"])
+            if diff_km <= tolerance_km + 1e-9:
+                candidate_pairs.append((diff_km, trw_idx, rec_idx))
 
-    if extra_kms:
-        # Snapshot existing template rows so we can rebuild cleanly without breaking merged cells (C:E, V:W, Y:Z)
-        template_rows_data = []
-        # Find a clean standard style row (e.g. Row 16 if available, else Row 15) for newly inserted rows
-        ref_style_row = 16 if ws.max_row >= 16 else 15
-        ref_styles = [copy(ws.cell(ref_style_row, c)._style) for c in range(1, comments_col + 1)]
-        ref_height = ws.row_dimensions[ref_style_row].height
+    # Sort by smallest distance first so the closest meterage pair always wins
+    candidate_pairs.sort(key=lambda x: x[0])
 
-        for r in range(data_start_row, ws.max_row + 1):
-            val = ws.cell(r, 2).value
-            try:
-                km_k = round(float(val), 3)
-            except (ValueError, TypeError):
-                continue
-            row_vals = [ws.cell(r, c).value for c in range(1, comments_col + 1)]
-            row_styles = [copy(ws.cell(r, c)._style) for c in range(1, comments_col + 1)]
-            row_ht = ws.row_dimensions[r].height
-            template_rows_data.append({
-                "km": km_k,
-                "vals": row_vals,
-                "styles": row_styles,
-                "height": row_ht,
-                "is_new": False,
-            })
+    matched_by_row = {}  # row_idx -> (rec, diff_m)
+    used_trw = set()
+    used_rec = set()
 
-        for km_new in extra_kms:
-            rec = records[km_new]
-            new_vals = [None] * comments_col
-            new_vals[1] = km_new  # Col B: Location KM
-            if rec.get("peg"):
-                new_vals[9] = rec["peg"]  # Col J: TCM Side U/D
-            if rec.get("align_des") is not None:
-                new_vals[11] = rec["align_des"]  # Col L: TCM Design
-            if rec.get("tc_des") is not None:
-                new_vals[15] = rec["tc_des"]  # Col P: Track Centres Design
-            if rec.get("super_des") is not None:
-                new_vals[18] = rec["super_des"]  # Col S: Superelevation Design
+    for diff_km, trw_idx, rec_idx in candidate_pairs:
+        if trw_idx not in used_trw and rec_idx not in used_rec:
+            used_trw.add(trw_idx)
+            used_rec.add(rec_idx)
+            row_idx = trw_rows[trw_idx][0]
+            matched_by_row[row_idx] = (records[rec_idx], round(diff_km * 1000.0, 2))
 
-            template_rows_data.append({
-                "km": km_new,
-                "vals": new_vals,
-                "styles": [copy(s) for s in ref_styles],
-                "height": ref_height,
-                "is_new": True,
-            })
+    unmatched_count = len(records) - len(used_rec)
+    logs.append(
+        f"Matched {len(matched_by_row)} existing TRW rows within ±{tolerance_m:g}m "
+        f"(ignored {unmatched_count} TrackMeas rows outside ±{tolerance_m:g}m; 0 rows inserted)."
+    )
 
-        # Sort all rows chronologically by KM
-        template_rows_data.sort(key=lambda x: x["km"])
-
-        # Unmerge any existing row-level merges from Row 15 downward before rewriting
-        merges_to_remove = [
-            rng for rng in list(ws.merged_cells.ranges) if rng.min_row >= data_start_row
-        ]
-        for rng in merges_to_remove:
-            ws.unmerge_cells(str(rng))
-
-        # Write sorted rows back and re-apply standard row merges (C:E, V:W, Y:Z)
-        for idx, item in enumerate(template_rows_data):
-            r = data_start_row + idx
-            if item["height"] is not None:
-                ws.row_dimensions[r].height = item["height"]
-            for c_idx in range(1, comments_col + 1):
-                cell = ws.cell(r, c_idx)
-                cell.value = item["vals"][c_idx - 1]
-                cell._style = copy(item["styles"][c_idx - 1])
-
-            ws.merge_cells(start_row=r, start_column=3, end_row=r, end_column=5)    # C:E
-            ws.merge_cells(start_row=r, start_column=22, end_row=r, end_column=23)  # V:W
-            ws.merge_cells(start_row=r, start_column=25, end_row=r, end_column=26)  # Y:Z
-
-    # 5. Populate Measurement Values, Wingdings 2 Ballast Ticks, and Comments
+    # 5. Populate Measurement Values, TCM Error Formula, Wingdings 2 Ballast Ticks, and Comments
     wingdings_font = Font(name="Wingdings 2", size=11, bold=False)
     center_align = Alignment(horizontal="center", vertical="center")
 
@@ -374,19 +326,17 @@ def populate_trw_workbook(trw_bytes: bytes, meta: dict, records: dict):
     ticked_count = 0
     preview_rows = []
 
-    for r in range(data_start_row, ws.max_row + 1):
-        val = ws.cell(r, 2).value
-        if val is None or str(val).strip() == "":
-            continue
-        try:
-            km_k = round(float(val), 3)
-        except (ValueError, TypeError):
-            continue
-
+    for r, km_k in trw_rows:
         ws.cell(r, 2).number_format = "0.000"
 
-        if km_k in records:
-            rec = records[km_k]
+        # Apply TCM Error formula in Column O (Col 15) for every data row:
+        # =IF(M{r}="","",IF(K{r}="H",L{r}-N{r},N{r}-L{r}))
+        err_cell = ws.cell(r, 15)
+        err_cell.value = f'=IF(M{r}="","",IF(K{r}="H",L{r}-N{r},N{r}-L{r}))'
+        err_cell.number_format = "0"
+
+        if r in matched_by_row:
+            rec, diff_m = matched_by_row[r]
             populated_count += 1
 
             # TCM Before (Col M = 13) & After (Col N = 14)
@@ -424,10 +374,21 @@ def populate_trw_workbook(trw_bytes: bytes, meta: dict, records: dict):
             if rec["comments"]:
                 ws.cell(r, comments_col).value = rec["comments"]
 
+            # Preview calculated TCM Error value for display in UI
+            tcm_des = clean_int(ws.cell(r, 12).value)
+            tcm_side_hl = (clean_str(ws.cell(r, 11).value) or "").upper()
+            tcm_err_preview = None
+            if rec["align_bef"] is not None and tcm_des is not None and rec["align_aft"] is not None:
+                tcm_err_preview = (tcm_des - rec["align_aft"]) if tcm_side_hl == "H" else (rec["align_aft"] - tcm_des)
+
             preview_rows.append({
-                "Location KM": f"{km_k:.3f}",
+                "UGL Row KM": f"{km_k:.3f}",
+                "Meas KM": f"{rec['km']:.3f}",
+                "Offset (m)": diff_m,
+                "TCM Design": tcm_des,
                 "TCM Before": rec["align_bef"],
                 "TCM After": rec["align_aft"],
+                "TCM Error": tcm_err_preview,
                 "Centres Before": rec["tc_bef"],
                 "Centres After": rec["tc_aft"],
                 "Super Before": rec["super_bef"],
@@ -436,7 +397,10 @@ def populate_trw_workbook(trw_bytes: bytes, meta: dict, records: dict):
                 "Comments": rec["comments"] or "",
             })
 
-    logs.append(f"Populated {populated_count} measurement rows ({ticked_count} rows ticked with Wingdings 2 'P').")
+    logs.append(
+        f"Populated {populated_count} existing UGL rows ({ticked_count} rows ticked with Wingdings 2 'P') "
+        f"and applied TCM Error formulas in Col O."
+    )
 
     out_buffer = io.BytesIO()
     wb.save(out_buffer)
@@ -471,14 +435,13 @@ prefix_text = st.text_input(
 
 if trw_file and app_file:
     if st.button("🚀 Populate UGL AR-Sheet", type="primary"):
-        with st.spinner("Matching kilometrages and populating TRW sheet..."):
+        with st.spinner("Matching kilometrages within ±1 m and populating TRW sheet..."):
             try:
                 meta, records, app_logs = parse_app_export(app_file.getvalue())
                 out_bytes, preview_df, trw_logs = populate_trw_workbook(
-                    trw_file.getvalue(), meta, records
+                    trw_file.getvalue(), meta, records, tolerance_m=1.0
                 )
 
-                # Build output filename: prefix + original TRW filename
                 output_filename = f"{prefix_text}{trw_file.name}"
 
                 st.session_state["trw_result"] = {
@@ -495,7 +458,6 @@ if "trw_result" in st.session_state:
     res = st.session_state["trw_result"]
     st.success(f"Ready for download: **{res['filename']}**")
 
-    # Show extracted header summary
     m1, m2, m3 = st.columns(3)
     m1.metric("Date of Works (F7)", res["meta"].get("date") or "—")
     m2.metric("Supervisor (F9)", res["meta"].get("team_leader") or "—")
